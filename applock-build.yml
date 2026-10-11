@@ -1,0 +1,1287 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create project files
+        run: |
+          set -e
+          mkdir -p proj
+          cd proj
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'APPLOCK_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.mahesh.applock"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.mahesh.applock"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.1")
+              implementation("androidx.fragment:fragment-ktx:1.8.2")
+              implementation("androidx.biometric:biometric:1.1.0")
+              implementation("androidx.security:security-crypto:1.1.0-alpha06")
+              implementation("androidx.lifecycle:lifecycle-process:2.8.4")
+          }
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/proguard-rules.pro')"
+          cat > 'app/proguard-rules.pro' <<'APPLOCK_EOF'
+          -dontwarn com.google.errorprone.annotations.**
+          -dontwarn javax.annotation.**
+          -keep class com.google.crypto.tink.** { *; }
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'APPLOCK_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application
+                  android:name=".App"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:allowBackup="false"
+                  android:theme="@style/AppTheme"
+                  android:supportsRtl="true">
+
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:screenOrientation="portrait" android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity android:name=".AppsActivity" android:exported="false" android:windowSoftInputMode="adjustResize"
+                      android:screenOrientation="portrait" android:configChanges="orientation|screenSize|keyboardHidden" />
+
+                  <activity android:name=".VaultActivity" android:exported="false"
+                      android:screenOrientation="portrait" android:configChanges="orientation|screenSize|keyboardHidden" />
+
+                  <activity android:name=".ConfirmActivity" android:exported="false"
+                      android:screenOrientation="portrait" android:configChanges="orientation|screenSize|keyboardHidden" />
+
+                  <activity android:name=".LockActivity" android:exported="false"
+                      android:launchMode="singleTask" android:taskAffinity=""
+                      android:screenOrientation="portrait" android:excludeFromRecents="true" />
+
+                  <service android:name=".AppLockService" android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+
+                  <receiver android:name=".AdminReceiver" android:exported="true"
+                      android:permission="android.permission.BIND_DEVICE_ADMIN">
+                      <meta-data android:name="android.app.device_admin" android:resource="@xml/device_admin" />
+                      <intent-filter>
+                          <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mahesh/applock/AdminReceiver.kt')"
+          cat > 'app/src/main/java/com/mahesh/applock/AdminReceiver.kt' <<'APPLOCK_EOF'
+          package com.mahesh.applock
+
+          import android.app.admin.DeviceAdminReceiver
+
+          class AdminReceiver : DeviceAdminReceiver()
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mahesh/applock/App.kt')"
+          cat > 'app/src/main/java/com/mahesh/applock/App.kt' <<'APPLOCK_EOF'
+          package com.mahesh.applock
+
+          import android.app.Application
+
+          object Session {
+              @Volatile var authAt = 0L
+              fun age(): Long = System.currentTimeMillis() - authAt
+              fun mark() { authAt = System.currentTimeMillis() }
+          }
+
+          class App : Application()
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mahesh/applock/AppLockService.kt')"
+          cat > 'app/src/main/java/com/mahesh/applock/AppLockService.kt' <<'APPLOCK_EOF'
+          package com.mahesh.applock
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.provider.Settings
+          import android.view.accessibility.AccessibilityEvent
+
+          class AppLockService : AccessibilityService() {
+              companion object {
+                  @Volatile var unlockedPkg: String? = null
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent) {
+                  if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+                  val pkg = e.packageName?.toString() ?: return
+                  if (pkg == packageName || pkg == "com.android.systemui" || isKeyboard(pkg)) return
+
+                  if (pkg != unlockedPkg) unlockedPkg = null // user app se bahar nikla -> agli baar phir lock
+                  if (pkg in SecureStore.lockedApps(this) && unlockedPkg != pkg) {
+                      startActivity(
+                          Intent(this, LockActivity::class.java)
+                              .putExtra(LockActivity.EXTRA_PKG, pkg)
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                      )
+                  }
+              }
+
+              private fun isKeyboard(pkg: String): Boolean =
+                  Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
+                      ?.startsWith("$pkg/") == true
+
+              override fun onInterrupt() {}
+          }
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mahesh/applock/AppsActivity.kt')"
+          cat > 'app/src/main/java/com/mahesh/applock/AppsActivity.kt' <<'APPLOCK_EOF'
+          package com.mahesh.applock
+
+          import android.content.Intent
+          import android.content.res.ColorStateList
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.EditText
+          import android.widget.FrameLayout
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Switch
+          import android.widget.TextView
+
+          class AppsActivity : SecureActivity() {
+              private val bgColor = 0xFF0A1018.toInt()
+              private val cardColor = 0xFF1C212B.toInt()
+              private val accent = 0xFFA8C7FA.toInt()
+              private val muted = 0xFF8E9AAF.toInt()
+              private val pastel = intArrayOf(0xFFA8C7FA.toInt(), 0xFFF9B4B4.toInt(), 0xFFFFC38A.toInt(), 0xFFB7E4C7.toInt())
+
+              private var all: List<Pair<String, String>> = emptyList()
+              private var listBox: LinearLayout? = null
+              private var built = false
+
+              override fun onResume() {
+                  super.onResume()
+                  gate(60_000L) { if (!built) render() }
+              }
+
+              override fun onAuthCancelled() {
+                  finish()
+              }
+
+              private fun render() {
+                  built = true
+                  window.statusBarColor = bgColor
+                  window.navigationBarColor = bgColor
+
+                  val pm = packageManager
+                  all = pm.queryIntentActivities(
+                      Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
+                  ).map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+                      .filter { it.first != packageName }
+                      .distinctBy { it.first }
+                      .sortedWith(compareBy({ it.first != SecureStore.PHOTOS }, { it.second.lowercase() }))
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(bgColor)
+                      setPadding(dp(16), dp(14), dp(16), 0)
+                  }
+
+                  val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  top.addView(TextView(this).apply {
+                      text = "←"; textSize = 28f; setTextColor(Color.WHITE); setPadding(0, 0, dp(16), 0)
+                      setOnClickListener { finish() }
+                  })
+                  top.addView(TextView(this).apply {
+                      text = "Lock Apps"; textSize = 26f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
+                  })
+                  root.addView(top)
+
+                  val pillBg = GradientDrawable().apply {
+                      setColor(0xFF0F1520.toInt())
+                      setStroke(dp(2), 0xFF3A4252.toInt())
+                      cornerRadius = dp(30).toFloat()
+                  }
+                  val pill = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(18), dp(4), dp(18), dp(4))
+                      background = pillBg
+                  }
+                  pill.addView(TextView(this).apply { text = "🔍"; textSize = 20f })
+                  val search = EditText(this).apply {
+                      hint = "Search apps"
+                      setHintTextColor(muted)
+                      setTextColor(Color.WHITE)
+                      textSize = 17f
+                      background = null
+                      maxLines = 1
+                      isSingleLine = true
+                      setPadding(dp(14), dp(12), 0, dp(12))
+                  }
+                  pill.addView(search, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  root.addView(pill, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                      topMargin = dp(16)
+                  })
+
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(0, 0, 0, dp(24))
+                  }
+                  listBox = box
+                  val sv = ScrollView(this)
+                  sv.isVerticalScrollBarEnabled = false
+                  sv.addView(box)
+                  root.addView(sv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+                  search.addTextChangedListener(object : TextWatcher {
+                      override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+                      override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+                      override fun afterTextChanged(s: Editable?) {
+                          fill(s?.toString() ?: "")
+                      }
+                  })
+                  fill("")
+                  setContentView(root)
+              }
+
+              private fun fill(q: String) {
+                  val box = listBox ?: return
+                  box.removeAllViews()
+                  val locked = SecureStore.lockedApps(this)
+                  val m = all.filter { it.second.contains(q, ignoreCase = true) }
+                  val a = m.filter { it.first in locked }
+                  val b = m.filter { it.first !in locked }
+                  addGroup(box, "Locked apps (${a.size})", a)
+                  addGroup(box, "All apps", b)
+                  if (m.isEmpty()) {
+                      box.addView(TextView(this).apply {
+                          text = "No apps found"; textSize = 15f; setTextColor(muted); gravity = Gravity.CENTER
+                          setPadding(0, dp(40), 0, 0)
+                      })
+                  }
+              }
+
+              private fun addGroup(box: LinearLayout, title: String, items: List<Pair<String, String>>) {
+                  if (items.isEmpty()) return
+                  box.addView(TextView(this).apply {
+                      text = title; textSize = 13f; setTextColor(accent); typeface = Typeface.DEFAULT_BOLD
+                      setPadding(dp(8), dp(18), 0, dp(8))
+                  })
+                  items.forEachIndexed { i, item -> box.addView(row(item, i == 0, i == items.size - 1)) }
+              }
+
+              private fun row(item: Pair<String, String>, first: Boolean, last: Boolean): LinearLayout {
+                  val pkg = item.first
+                  val big = dp(26).toFloat()
+                  val small = dp(6).toFloat()
+                  val tl = if (first) big else small
+                  val bl = if (last) big else small
+                  val cardBg = GradientDrawable().apply {
+                      setColor(cardColor)
+                      cornerRadii = floatArrayOf(tl, tl, tl, tl, bl, bl, bl, bl)
+                  }
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(16), dp(14), dp(16), dp(14))
+                      background = cardBg
+                  }
+
+                  val circleBg = GradientDrawable().apply {
+                      shape = GradientDrawable.OVAL
+                      setColor(pastel[Math.abs(pkg.hashCode()) % pastel.size])
+                  }
+                  val circle = FrameLayout(this)
+                  circle.background = circleBg
+                  val iv = ImageView(this)
+                  try {
+                      iv.setImageDrawable(packageManager.getApplicationIcon(pkg))
+                  } catch (e: Exception) {
+                      // no icon
+                  }
+                  circle.addView(iv, FrameLayout.LayoutParams(dp(30), dp(30), Gravity.CENTER))
+                  row.addView(circle, LinearLayout.LayoutParams(dp(48), dp(48)))
+
+                  val label = TextView(this)
+                  label.text = item.second
+                  label.textSize = 18f
+                  label.setTextColor(Color.WHITE)
+                  label.setPadding(dp(16), 0, dp(8), 0)
+                  row.addView(label, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+                  val sw = Switch(this)
+                  sw.isChecked = pkg in SecureStore.lockedApps(this)
+                  sw.isClickable = false
+                  sw.thumbTintList = ColorStateList(
+                      arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                      intArrayOf(0xFF0A1018.toInt(), muted)
+                  )
+                  sw.trackTintList = ColorStateList(
+                      arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                      intArrayOf(accent, 0xFF3A4252.toInt())
+                  )
+                  row.addView(sw)
+
+                  row.setOnClickListener {
+                      gate {
+                          val nowOn = pkg !in SecureStore.lockedApps(this)
+                          SecureStore.setLocked(this, pkg, nowOn)
+                          sw.isChecked = nowOn
+                      }
+                  }
+                  row.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                      topMargin = dp(3)
+                  }
+                  return row
+              }
+          }
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mahesh/applock/ConfirmActivity.kt')"
+          cat > 'app/src/main/java/com/mahesh/applock/ConfirmActivity.kt' <<'APPLOCK_EOF'
+          package com.mahesh.applock
+
+          /** PIN / fingerprint screen used inside this app; returns OK only when the user is verified. */
+          class ConfirmActivity : LockActivity() {
+              override fun onSuccess() {
+                  Session.mark()
+                  setResult(RESULT_OK)
+                  finish()
+              }
+
+              override fun onCancel() {
+                  setResult(RESULT_CANCELED)
+                  finish()
+              }
+          }
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mahesh/applock/LockActivity.kt')"
+          cat > 'app/src/main/java/com/mahesh/applock/LockActivity.kt' <<'APPLOCK_EOF'
+          package com.mahesh.applock
+
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.GridLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.OnBackPressedCallback
+          import androidx.biometric.BiometricManager
+          import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
+          import androidx.biometric.BiometricPrompt
+          import androidx.core.content.ContextCompat
+          import androidx.fragment.app.FragmentActivity
+
+          open class LockActivity : FragmentActivity() {
+              companion object {
+                  const val EXTRA_MODE = "mode"
+                  const val MODE_SETUP = "setup"
+                  const val EXTRA_PKG = "pkg"
+              }
+
+              private var mode = ""
+              protected var target: String? = null
+              private var first: String? = null
+              private var bioTried = false
+              private val pin = StringBuilder()
+              private lateinit var titleTv: TextView
+              private lateinit var dotsTv: TextView
+              private lateinit var msgTv: TextView
+              private val keys = mutableListOf<Button>()
+              private val handler = Handler(Looper.getMainLooper())
+
+              protected open fun onSuccess() {
+                  AppLockService.unlockedPkg = target
+                  finish()
+              }
+
+              protected open fun onCancel() {
+                  goHome()
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+                  readIntent(intent)
+                  buildUi()
+                  onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+                      override fun handleOnBackPressed() {
+                          onCancel()
+                      }
+                  })
+              }
+
+              override fun onNewIntent(i: Intent) {
+                  super.onNewIntent(i)
+                  setIntent(i)
+                  readIntent(i)
+                  pin.clear()
+                  first = null
+                  bioTried = false
+                  updateTexts()
+              }
+
+              private fun readIntent(i: Intent) {
+                  mode = i.getStringExtra(EXTRA_MODE) ?: ""
+                  target = i.getStringExtra(EXTRA_PKG)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (mode != MODE_SETUP && SecureStore.biometricOn(this) && !bioTried) {
+                      bioTried = true
+                      showBiometric()
+                  }
+                  refreshLock()
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
+                  super.onDestroy()
+              }
+
+              private fun oval(color: Int): GradientDrawable =
+                  GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(color) }
+
+              private fun buildUi() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(dp(24), dp(24), dp(24), dp(24))
+                      background = grad(0xFF4A148C.toInt(), 0xFF0D47A1.toInt())
+                  }
+                  root.addView(TextView(this).apply { text = "🔐"; textSize = 44f; gravity = Gravity.CENTER })
+                  titleTv = TextView(this).apply {
+                      textSize = 20f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                      typeface = Typeface.DEFAULT_BOLD; setPadding(0, dp(8), 0, 0)
+                  }
+                  dotsTv = TextView(this).apply {
+                      textSize = 28f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                      setPadding(0, dp(14), 0, dp(6))
+                  }
+                  msgTv = TextView(this).apply {
+                      textSize = 14f; setTextColor(0xFFFFAB91.toInt()); gravity = Gravity.CENTER; minHeight = dp(26)
+                  }
+                  root.addView(titleTv)
+                  root.addView(dotsTv)
+                  root.addView(msgTv)
+
+                  val grid = GridLayout(this).apply { columnCount = 3 }
+                  listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "⌫", "0", "OK").forEach { l ->
+                      val btn = Button(this).apply {
+                          text = l
+                          textSize = 24f
+                          setTextColor(Color.WHITE)
+                          typeface = Typeface.DEFAULT_BOLD
+                          background = oval(if (l == "OK") 0xFF00C853.toInt() else 0x33FFFFFF)
+                          setOnClickListener { press(l) }
+                          layoutParams = GridLayout.LayoutParams().apply {
+                              width = dp(76); height = dp(76); setMargins(dp(7), dp(7), dp(7), dp(7))
+                          }
+                      }
+                      keys.add(btn)
+                      grid.addView(btn)
+                  }
+                  root.addView(grid)
+
+                  if (mode != MODE_SETUP) {
+                      root.addView(TextView(this).apply {
+                          text = "👆  Use fingerprint"
+                          textSize = 16f
+                          setTextColor(Color.WHITE)
+                          setPadding(dp(18), dp(14), dp(18), dp(14))
+                          setOnClickListener { showBiometric() }
+                      })
+                  }
+                  setContentView(root)
+                  updateTexts()
+              }
+
+              private fun updateTexts() {
+                  titleTv.text = when {
+                      mode == MODE_SETUP && first == null -> "Create a PIN (4-8 digits)"
+                      mode == MODE_SETUP -> "Confirm your PIN"
+                      else -> "Enter PIN"
+                  }
+                  val n = pin.length
+                  dotsTv.text = (0 until maxOf(4, n)).joinToString(" ") { if (it < n) "●" else "○" }
+              }
+
+              private fun press(l: String) {
+                  when (l) {
+                      "⌫" -> if (pin.isNotEmpty()) pin.deleteCharAt(pin.length - 1)
+                      "OK" -> if (pin.length >= 4) submit(pin.toString())
+                              else Toast.makeText(this, "At least 4 digits", Toast.LENGTH_SHORT).show()
+                      else -> if (pin.length < 8) pin.append(l)
+                  }
+                  updateTexts()
+              }
+
+              private fun submit(p: String) {
+                  pin.clear()
+                  if (mode == MODE_SETUP) {
+                      if (first == null) {
+                          first = p
+                      } else if (first == p) {
+                          SecureStore.setPin(this, p)
+                          onSuccess()
+                          return
+                      } else {
+                          first = null
+                          msgTv.text = "PINs did not match, try again"
+                      }
+                  } else {
+                      if (SecureStore.verify(this, p)) {
+                          onSuccess()
+                          return
+                      }
+                      msgTv.text = "Wrong PIN"
+                      refreshLock()
+                  }
+                  updateTexts()
+              }
+
+              private fun refreshLock() {
+                  val rem = SecureStore.lockRemainingMs(this)
+                  keys.forEach { it.isEnabled = rem <= 0 }
+                  if (rem > 0) {
+                      msgTv.text = "Too many tries. Wait ${rem / 1000 + 1}s"
+                      handler.postDelayed({ refreshLock() }, 500)
+                  } else if (msgTv.text.startsWith("Too many")) {
+                      msgTv.text = ""
+                  }
+              }
+
+              private fun showBiometric() {
+                  if (BiometricManager.from(this).canAuthenticate(BIOMETRIC_STRONG) != BiometricManager.BIOMETRIC_SUCCESS) return
+                  val prompt = BiometricPrompt(this, ContextCompat.getMainExecutor(this),
+                      object : BiometricPrompt.AuthenticationCallback() {
+                          override fun onAuthenticationSucceeded(r: BiometricPrompt.AuthenticationResult) {
+                              onSuccess()
+                          }
+                      })
+                  prompt.authenticate(
+                      BiometricPrompt.PromptInfo.Builder()
+                          .setTitle("Unlock")
+                          .setNegativeButtonText("Use PIN")
+                          .setAllowedAuthenticators(BIOMETRIC_STRONG)
+                          .build()
+                  )
+              }
+
+              protected fun goHome() {
+                  startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  finish()
+              }
+          }
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mahesh/applock/MainActivity.kt')"
+          cat > 'app/src/main/java/com/mahesh/applock/MainActivity.kt' <<'APPLOCK_EOF'
+          package com.mahesh.applock
+
+          import android.app.AlertDialog
+          import android.app.admin.DevicePolicyManager
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.File
+
+          class MainActivity : SecureActivity() {
+
+              override fun onResume() {
+                  super.onResume()
+                  if (!SecureStore.hasPin(this)) gate(setup = true) { render() } else gate(60_000L) { render() }
+              }
+
+              override fun onAuthCancelled() {
+                  finishAffinity()
+              }
+
+              private fun a11yOn(): Boolean {
+                  val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+                  return s.contains(ComponentName(this, AppLockService::class.java).flattenToString())
+              }
+
+              private fun render() {
+                  val on = a11yOn()
+                  val lockedCount = SecureStore.lockedApps(this).size
+                  val vaultCount = File(filesDir, "vault").listFiles()?.size ?: 0
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(36), dp(20), dp(20))
+                      background = grad(0xFF4A148C.toInt(), 0xFF0D47A1.toInt())
+                  }
+
+                  val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  top.addView(TextView(this).apply {
+                      text = "🛡️ App Lock"; textSize = 26f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
+                  }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  top.addView(TextView(this).apply {
+                      text = "⚙️"; textSize = 26f; setPadding(dp(12), dp(4), dp(4), dp(4))
+                      setOnClickListener { settings() }
+                  })
+                  root.addView(top)
+
+                  val status = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(dp(20), dp(22), dp(20), dp(22))
+                      background = grad(0x33FFFFFF, 0x33FFFFFF, 24)
+                  }
+                  status.addView(TextView(this).apply { text = if (on) "✅" else "⚠️"; textSize = 48f; gravity = Gravity.CENTER })
+                  status.addView(TextView(this).apply {
+                      text = if (on) "Protection is ON" else "Protection is OFF"
+                      textSize = 20f
+                      typeface = Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
+                      setTextColor(if (on) 0xFF69F0AE.toInt() else 0xFFFFCC80.toInt())
+                  })
+                  if (!on) {
+                      status.addView(Button(this).apply {
+                          text = "Turn ON"
+                          setTextColor(Color.WHITE)
+                          typeface = Typeface.DEFAULT_BOLD
+                          background = grad(0xFFFF9800.toInt(), 0xFFE65100.toInt(), 16, true)
+                          setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                      }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                          topMargin = dp(10)
+                      })
+                  }
+                  root.addView(status, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                      topMargin = dp(22)
+                  })
+
+                  root.addView(bigCard("🔒", "Lock Apps", "$lockedCount locked", 0xFFFF9800.toInt(), 0xFFE65100.toInt()) {
+                      startActivity(Intent(this, AppsActivity::class.java))
+                  })
+                  root.addView(bigCard("🗂️", "Private Vault", "$vaultCount files hidden", 0xFF00BFA5.toInt(), 0xFF00695C.toInt()) {
+                      startActivity(Intent(this, VaultActivity::class.java))
+                  })
+                  setContentView(root)
+              }
+
+              private fun bigCard(icon: String, title: String, sub: String, c1: Int, c2: Int, onClick: () -> Unit): LinearLayout {
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(20), dp(20), dp(20), dp(20))
+                      background = grad(c1, c2, 24, true)
+                      elevation = dp(6).toFloat()
+                      setOnClickListener { onClick() }
+                  }
+                  row.addView(TextView(this).apply { text = icon; textSize = 38f })
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), 0, 0, 0)
+                  }
+                  col.addView(TextView(this).apply {
+                      text = title; textSize = 20f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
+                  })
+                  col.addView(TextView(this).apply { text = sub; textSize = 13f; setTextColor(0xCCFFFFFF.toInt()) })
+                  row.addView(col, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  row.addView(TextView(this).apply { text = "›"; textSize = 32f; setTextColor(Color.WHITE) })
+                  row.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                      topMargin = dp(16)
+                  }
+                  return row
+              }
+
+              private fun settings() {
+                  val fp = if (SecureStore.biometricOn(this)) "ON" else "OFF"
+                  AlertDialog.Builder(this)
+                      .setTitle("Settings")
+                      .setItems(arrayOf("Fingerprint: $fp", "Change PIN", "Uninstall protection")) { _, which ->
+                          when (which) {
+                              0 -> gate {
+                                  SecureStore.setBiometric(this, !SecureStore.biometricOn(this))
+                                  Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show()
+                              }
+                              1 -> gate {
+                                  gate(setup = true) { Toast.makeText(this, "PIN changed", Toast.LENGTH_SHORT).show() }
+                              }
+                              2 -> gate {
+                                  startActivity(
+                                      Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+                                          .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, ComponentName(this, AdminReceiver::class.java))
+                                  )
+                              }
+                              else -> {}
+                          }
+                      }
+                      .show()
+              }
+          }
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mahesh/applock/SecureActivity.kt')"
+          cat > 'app/src/main/java/com/mahesh/applock/SecureActivity.kt' <<'APPLOCK_EOF'
+          package com.mahesh.applock
+
+          import android.content.Intent
+          import android.os.Bundle
+          import android.view.WindowManager
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.fragment.app.FragmentActivity
+
+          /** Base screen: blocks screenshots and offers gate() = ask PIN / fingerprint before a sensitive action. */
+          open class SecureActivity : FragmentActivity() {
+              private var pend: (() -> Unit)? = null
+
+              private val authLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                  val a = pend
+                  pend = null
+                  if (r.resultCode == RESULT_OK) a?.invoke() else onAuthCancelled()
+              }
+
+              protected open fun onAuthCancelled() {}
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+              }
+
+              /** Runs action only after a fresh PIN/fingerprint check (valid for maxAgeMs). */
+              protected fun gate(maxAgeMs: Long = 20_000L, setup: Boolean = false, action: () -> Unit) {
+                  if (pend != null) return
+                  if (!setup && Session.age() < maxAgeMs) {
+                      action()
+                      return
+                  }
+                  pend = action
+                  val i = Intent(this, ConfirmActivity::class.java)
+                  if (setup) i.putExtra(LockActivity.EXTRA_MODE, LockActivity.MODE_SETUP)
+                  authLauncher.launch(i)
+              }
+          }
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mahesh/applock/SecureStore.kt')"
+          cat > 'app/src/main/java/com/mahesh/applock/SecureStore.kt' <<'APPLOCK_EOF'
+          package com.mahesh.applock
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.util.Base64
+          import androidx.security.crypto.EncryptedSharedPreferences
+          import androidx.security.crypto.MasterKey
+          import java.security.MessageDigest
+          import java.security.SecureRandom
+          import javax.crypto.SecretKeyFactory
+          import javax.crypto.spec.PBEKeySpec
+
+          object SecureStore {
+              const val PHOTOS = "com.google.android.apps.photos"
+              private const val ITER = 120_000
+              @Volatile private var prefs: SharedPreferences? = null
+
+              fun masterKey(c: Context): MasterKey =
+                  MasterKey.Builder(c.applicationContext).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build()
+
+              private fun sp(c: Context): SharedPreferences = prefs ?: synchronized(this) {
+                  prefs ?: EncryptedSharedPreferences.create(
+                      c.applicationContext, "secure_prefs", masterKey(c),
+                      EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                      EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+                  ).also { prefs = it }
+              }
+
+              private fun hash(pin: String, salt: ByteArray): ByteArray =
+                  SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+                      .generateSecret(PBEKeySpec(pin.toCharArray(), salt, ITER, 256)).encoded
+
+              private fun b64(b: ByteArray) = Base64.encodeToString(b, Base64.NO_WRAP)
+              private fun unb64(s: String) = Base64.decode(s, Base64.NO_WRAP)
+
+              fun hasPin(c: Context) = sp(c).contains("hash")
+
+              fun setPin(c: Context, pin: String) {
+                  val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
+                  val e = sp(c).edit()
+                      .putString("salt", b64(salt)).putString("hash", b64(hash(pin, salt)))
+                      .putInt("fails", 0).putLong("lockUntil", 0)
+                  if (!sp(c).contains("locked")) e.putStringSet("locked", setOf(PHOTOS)) // Google Photos default locked
+                  e.apply()
+              }
+
+              fun lockRemainingMs(c: Context): Long =
+                  (sp(c).getLong("lockUntil", 0) - System.currentTimeMillis()).coerceAtLeast(0)
+
+              fun verify(c: Context, pin: String): Boolean {
+                  if (lockRemainingMs(c) > 0) return false
+                  val s = sp(c)
+                  val salt = unb64(s.getString("salt", "") ?: return false)
+                  val expected = unb64(s.getString("hash", "") ?: return false)
+                  val ok = MessageDigest.isEqual(expected, hash(pin, salt))
+                  if (ok) {
+                      s.edit().putInt("fails", 0).putLong("lockUntil", 0).apply()
+                  } else {
+                      val f = s.getInt("fails", 0) + 1
+                      var until = 0L
+                      if (f >= 5) { // 5 galat ke baad 30s, phir double hota jayega (max 1 ghanta)
+                          val d = minOf(30_000L shl minOf(f - 5, 7), 3_600_000L)
+                          until = System.currentTimeMillis() + d
+                      }
+                      s.edit().putInt("fails", f).putLong("lockUntil", until).apply()
+                  }
+                  return ok
+              }
+
+              fun lockedApps(c: Context): Set<String> = sp(c).getStringSet("locked", emptySet()) ?: emptySet()
+              fun setLocked(c: Context, pkg: String, on: Boolean) {
+                  val n = HashSet(lockedApps(c))
+                  if (on) n.add(pkg) else n.remove(pkg)
+                  sp(c).edit().putStringSet("locked", n).apply()
+              }
+
+              fun biometricOn(c: Context) = sp(c).getBoolean("bio", true)
+              fun setBiometric(c: Context, on: Boolean) = sp(c).edit().putBoolean("bio", on).apply()
+          }
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mahesh/applock/Ui.kt')"
+          cat > 'app/src/main/java/com/mahesh/applock/Ui.kt' <<'APPLOCK_EOF'
+          package com.mahesh.applock
+
+          import android.content.Context
+          import android.graphics.drawable.GradientDrawable
+
+          fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+          fun Context.grad(c1: Int, c2: Int, rDp: Int = 0, horizontal: Boolean = false): GradientDrawable =
+              GradientDrawable(
+                  if (horizontal) GradientDrawable.Orientation.LEFT_RIGHT else GradientDrawable.Orientation.TOP_BOTTOM,
+                  intArrayOf(c1, c2)
+              ).apply { cornerRadius = dp(rDp).toFloat() }
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/mahesh/applock/VaultActivity.kt')"
+          cat > 'app/src/main/java/com/mahesh/applock/VaultActivity.kt' <<'APPLOCK_EOF'
+          package com.mahesh.applock
+
+          import android.app.AlertDialog
+          import android.app.Dialog
+          import android.content.ContentValues
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.DocumentsContract
+          import android.provider.MediaStore
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.webkit.MimeTypeMap
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.MediaController
+          import android.widget.TextView
+          import android.widget.Toast
+          import android.widget.VideoView
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.security.crypto.EncryptedFile
+          import java.io.File
+          import java.util.UUID
+
+          class VaultActivity : SecureActivity() {
+              private val dir by lazy { File(filesDir, "vault").apply { mkdirs() } }
+              private val files = mutableListOf<File>()
+              private var list: ListView? = null
+              private var emptyTv: TextView? = null
+              private val labels = mutableListOf<String>()
+              private var ad: ArrayAdapter<String>? = null
+
+              private val picker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+                  if (uris.isNotEmpty()) gate { importAll(uris) }
+              }
+
+              private fun enc(f: File) = EncryptedFile.Builder(
+                  this, f, SecureStore.masterKey(this), EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
+              ).build()
+
+              private fun mimeOf(f: File) = f.name.substringAfter("__").replaceFirst("-", "/")
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  cacheDir.listFiles()?.filter { it.name.startsWith("play_") }?.forEach { it.delete() }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  gate { ensureUi(); reload() }
+              }
+
+              override fun onAuthCancelled() {
+                  finish()
+              }
+
+              private fun ensureUi() {
+                  if (list != null) return
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(30), dp(16), dp(12))
+                      background = grad(0xFF00897B.toInt(), 0xFF1A237E.toInt())
+                  }
+                  val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  top.addView(TextView(this).apply {
+                      text = "←"; textSize = 28f; setTextColor(Color.WHITE); setPadding(0, 0, dp(14), 0)
+                      setOnClickListener { finish() }
+                  })
+                  top.addView(TextView(this).apply {
+                      text = "🗂️ Private Vault"; textSize = 24f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
+                  })
+                  root.addView(top)
+                  root.addView(Button(this).apply {
+                      text = "➕  Add photos & videos"
+                      textSize = 18f
+                      setTextColor(Color.WHITE)
+                      typeface = Typeface.DEFAULT_BOLD
+                      background = grad(0xFFFF9800.toInt(), 0xFFE65100.toInt(), 18, true)
+                      setOnClickListener { gate { picker.launch(arrayOf("image/*", "video/*")) } }
+                  }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(58)).apply {
+                      topMargin = dp(18); bottomMargin = dp(12)
+                  })
+                  val tv = TextView(this).apply {
+                      text = "Vault is empty\nTap Add to hide photos & videos"
+                      textSize = 15f
+                      setTextColor(0xCCFFFFFF.toInt())
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(40), 0, 0)
+                  }
+                  root.addView(tv)
+                  val a = object : ArrayAdapter<String>(this, 0, labels) {
+                      override fun getView(pos: Int, v: View?, p: ViewGroup): View {
+                          val t = TextView(context)
+                          t.text = getItem(pos)
+                          t.textSize = 17f
+                          t.setTextColor(Color.WHITE)
+                          t.setPadding(dp(16), dp(16), dp(16), dp(16))
+                          t.background = grad(0x33FFFFFF, 0x33FFFFFF, 16)
+                          return t
+                      }
+                  }
+                  val lv = ListView(this)
+                  lv.adapter = a
+                  lv.divider = null
+                  lv.dividerHeight = dp(8)
+                  lv.setOnItemClickListener { _, _, i, _ -> gate { open(files[i]) } }
+                  lv.setOnItemLongClickListener { _, _, i, _ -> options(files[i]); true }
+                  root.addView(lv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                  root.addView(TextView(this).apply {
+                      text = "Tap to view • Hold for options"
+                      textSize = 12f
+                      setTextColor(0x99FFFFFF.toInt())
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(6), 0, 0)
+                  })
+                  setContentView(root)
+                  list = lv
+                  emptyTv = tv
+                  ad = a
+              }
+
+              private fun reload() {
+                  files.clear()
+                  files.addAll(dir.listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList())
+                  var p = 0
+                  var v = 0
+                  labels.clear()
+                  files.forEach {
+                      val kb = it.length() / 1024
+                      labels.add(if (mimeOf(it).startsWith("video/")) "🎬  Video ${++v}   ($kb KB)" else "🖼️  Photo ${++p}   ($kb KB)")
+                  }
+                  ad?.notifyDataSetChanged()
+                  emptyTv?.visibility = if (files.isEmpty()) View.VISIBLE else View.GONE
+              }
+
+              private fun importAll(uris: List<Uri>) {
+                  ensureUi()
+                  Thread {
+                      var ok = 0
+                      var deleted = 0
+                      for (u in uris) {
+                          try {
+                              val mime = contentResolver.getType(u) ?: "image/jpeg"
+                              val f = File(dir, "${UUID.randomUUID()}__${mime.replaceFirst("/", "-")}")
+                              contentResolver.openInputStream(u)!!.use { input ->
+                                  enc(f).openFileOutput().use { out -> input.copyTo(out) }
+                              }
+                              ok++
+                              try {
+                                  if (DocumentsContract.deleteDocument(contentResolver, u)) deleted++
+                              } catch (_: Exception) {
+                              }
+                          } catch (e: Exception) {
+                              // skip file
+                          }
+                      }
+                      runOnUiThread {
+                          val note = if (deleted < ok) "\nDelete the originals from Gallery yourself (${ok - deleted} left)." else ""
+                          Toast.makeText(this, "$ok file(s) hidden.$note", Toast.LENGTH_LONG).show()
+                          reload()
+                      }
+                  }.start()
+              }
+
+              private fun fullScreen(): Dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen).also {
+                  it.window?.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+              }
+
+              private fun open(f: File) {
+                  Thread {
+                      try {
+                          if (mimeOf(f).startsWith("video/")) {
+                              val tmp = File(cacheDir, "play_${f.name}.mp4")
+                              enc(f).openFileInput().use { i -> tmp.outputStream().use { o -> i.copyTo(o) } }
+                              runOnUiThread {
+                                  val d = fullScreen()
+                                  val vv = VideoView(this)
+                                  val mc = MediaController(this)
+                                  mc.setAnchorView(vv)
+                                  vv.setMediaController(mc)
+                                  vv.setVideoPath(tmp.absolutePath)
+                                  d.setContentView(vv)
+                                  d.setOnDismissListener { vv.stopPlayback(); tmp.delete() }
+                                  d.show()
+                                  vv.start()
+                              }
+                          } else {
+                              val bytes = enc(f).openFileInput().use { it.readBytes() }
+                              val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                              BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o)
+                              var s = 1
+                              while (o.outWidth / s > 2048 || o.outHeight / s > 2048) s *= 2
+                              val opt = BitmapFactory.Options().apply { inSampleSize = s }
+                              val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opt)
+                              runOnUiThread {
+                                  val d = fullScreen()
+                                  val iv = ImageView(this)
+                                  iv.setImageBitmap(bmp)
+                                  iv.scaleType = ImageView.ScaleType.FIT_CENTER
+                                  d.setContentView(iv)
+                                  d.show()
+                              }
+                          }
+                      } catch (e: Exception) {
+                          runOnUiThread { Toast.makeText(this, "Could not open file", Toast.LENGTH_SHORT).show() }
+                      }
+                  }.start()
+              }
+
+              private fun options(f: File) {
+                  AlertDialog.Builder(this)
+                      .setItems(arrayOf("Send back to Gallery", "Delete forever")) { _, w ->
+                          if (w == 0) {
+                              gate { restore(f) }
+                          } else {
+                              AlertDialog.Builder(this).setMessage("Delete this file forever?")
+                                  .setPositiveButton("Delete") { _, _ -> gate { f.delete(); reload() } }
+                                  .setNegativeButton("Cancel", null).show()
+                          }
+                      }.show()
+              }
+
+              private fun restore(f: File) {
+                  Thread {
+                      try {
+                          val mime = mimeOf(f)
+                          val vid = mime.startsWith("video/")
+                          val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime) ?: if (vid) "mp4" else "jpg"
+                          val cv = ContentValues().apply {
+                              put(MediaStore.MediaColumns.DISPLAY_NAME, "restored_${System.currentTimeMillis()}.$ext")
+                              put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                              put(MediaStore.MediaColumns.RELATIVE_PATH, if (vid) "Movies/Restored" else "Pictures/Restored")
+                          }
+                          val coll = if (vid) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                          val u = contentResolver.insert(coll, cv)!!
+                          contentResolver.openOutputStream(u)!!.use { out -> enc(f).openFileInput().use { it.copyTo(out) } }
+                          f.delete()
+                          runOnUiThread { Toast.makeText(this, "Sent back to Gallery", Toast.LENGTH_SHORT).show(); reload() }
+                      } catch (e: Exception) {
+                          runOnUiThread { Toast.makeText(this, "Restore failed", Toast.LENGTH_SHORT).show() }
+                      }
+                  }.start()
+              }
+          }
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_launcher_foreground.xml')"
+          cat > 'app/src/main/res/drawable/ic_launcher_foreground.xml' <<'APPLOCK_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:strokeColor="#FFFFFF" android:strokeWidth="5" android:strokeLineCap="round"
+                  android:pathData="M45,52 L45,44 A9,9 0 0,1 63,44 L63,52" />
+              <path android:fillColor="#26C6DA"
+                  android:pathData="M40,52 L68,52 Q70,52 70,54 L70,76 Q70,78 68,78 L40,78 Q38,78 38,76 L38,54 Q38,52 40,52 Z" />
+              <path android:fillColor="#101820"
+                  android:pathData="M51,63 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0 Z M52.8,64 L55.2,64 L55.2,71 L52.8,71 Z" />
+          </vector>
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml')"
+          cat > 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml' <<'APPLOCK_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/res/values/colors.xml')"
+          cat > 'app/src/main/res/values/colors.xml' <<'APPLOCK_EOF'
+          <resources>
+              <color name="ic_launcher_background">#101820</color>
+          </resources>
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'APPLOCK_EOF'
+          <resources>
+              <string name="app_name">App Lock</string>
+              <string name="a11y_desc">Locked apps khulte hi PIN/fingerprint screen dikhane ke liye. Ye service screen ka content nahi padhti, sirf app ka package naam dekhti hai.</string>
+          </resources>
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/res/values/themes.xml')"
+          cat > 'app/src/main/res/values/themes.xml' <<'APPLOCK_EOF'
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar" />
+          </resources>
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/res/xml/accessibility_config.xml')"
+          cat > 'app/src/main/res/xml/accessibility_config.xml' <<'APPLOCK_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canRetrieveWindowContent="false"
+              android:notificationTimeout="50"
+              android:description="@string/a11y_desc" />
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'app/src/main/res/xml/device_admin.xml')"
+          cat > 'app/src/main/res/xml/device_admin.xml' <<'APPLOCK_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-policies />
+          </device-admin>
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'APPLOCK_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'APPLOCK_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          APPLOCK_EOF
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'APPLOCK_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AppLock"
+          include(":app")
+          APPLOCK_EOF
+
+      - name: Use custom logo (only if logo.png is in repo root)
+        run: |
+          if [ -f logo.png ]; then
+            command -v convert >/dev/null || sudo apt-get install -y imagemagick
+            for s in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+              d=${s%%:*}; px=${s##*:}
+              mkdir -p proj/app/src/main/res/mipmap-$d
+              convert logo.png -resize ${px}x${px}^ -gravity center -extent ${px}x${px} proj/app/src/main/res/mipmap-$d/ic_launcher.png
+            done
+            rm -rf proj/app/src/main/res/mipmap-anydpi-v26
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept Android licenses
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          yes | "$SDKM" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AppLock-debug-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
